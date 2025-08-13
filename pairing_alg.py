@@ -4,9 +4,7 @@ from typing import List, Optional, Tuple, Dict, Set
 import math
 import pandas as pd
 
-# -----------------------------
-# Data model
-# -----------------------------
+
 @dataclass
 class Player:
     pid: str                 # unique id (string)
@@ -19,7 +17,7 @@ class Player:
     requested_bye: bool = False
     available: bool = True
 
-    # derived helpers
+    # Helper
     def color_counts(self) -> Tuple[int, int]:
         w = sum(c == 'W' for c in self.colors)
         b = sum(c == 'B' for c in self.colors)
@@ -64,9 +62,8 @@ class Player:
         return False
 
 
-# -----------------------------
+
 # Pairing core
-# -----------------------------
 class USCFPairer:
     """
     Practical USCF-style Swiss pairer (simplified but faithful to key priorities):
@@ -178,6 +175,7 @@ class USCFPairer:
                             break
         return pairs
 
+
     # ---- Main public API ----
     def pair_next_round(
         self,
@@ -251,9 +249,8 @@ class USCFPairer:
         return pairings, bye_pid
 
 
-# -----------------------------
+
 # Builders from DataFrames
-# -----------------------------
 def build_players(
     standings_df: pd.DataFrame,
     history_df: Optional[pd.DataFrame] = None,
