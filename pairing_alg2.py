@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict, Set
 import math
 import pandas as pd
+import re
 
 @dataclass
 class Player:
@@ -249,6 +250,105 @@ class USCFPairer:
 
 
 # -----------------------------
+# CSV Parser for Tournament Data
+# -----------------------------
+def parse_tournament_csv(csv_file_path: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Parse a tournament CSV in the format you provided and return standings_df and history_df.
+    
+    Expected CSV format:
+    - Columns: #, Name, ID, Rating, Fed, Rd 1, Rd 2, ..., Total
+    - Round results like: "W29 (b)", "D6 (w)", "L2 (b)", "H---", "U---", etc.
+    
+    Returns:
+        standings_df: DataFrame with columns [id, name, rating, score]
+        history_df: DataFrame with columns [round, white_id, white_name, black_id, black_name, bye_id]
+    """
+    # Read the CSV
+    df = pd.read_csv(csv_file_path)
+    
+    # Create standings DataFrame
+    standings_data = []
+    for _, row in df.iterrows():
+        standings_data.append({
+            'id': str(row['ID']),
+            'name': row['Name'],
+            'rating': row['Rating'] if pd.notna(row['Rating']) else None,
+            'score': row['Total']
+        })
+    
+    standings_df = pd.DataFrame(standings_data)
+    
+    # Create history DataFrame by parsing round columns
+    history_data = []
+    round_cols = [col for col in df.columns if col.startswith('Rd ')]
+    
+    for round_num, col in enumerate(round_cols, 1):
+        round_games = {}  # Track games for this round
+        round_byes = []
+        
+        for _, row in df.iterrows():
+            player_id = str(row['ID'])
+            player_name = row['Name']
+            result = row[col]
+            
+            if pd.isna(result) or result in ['U---', 'F---']:
+                continue
+                
+            if result == 'H---':  # Half-point bye
+                round_byes.append(player_id)
+                continue
+                
+            # Parse result like "W29 (b)" or "D6 (w)"
+            match = re.match(r'([WLD])(\d+)\s*\(([wb])\)', str(result))
+            if match:
+                result_type, opp_id, color = match.groups()
+                opp_id = str(opp_id)
+                
+                # Create a game key to avoid duplicates
+                game_key = tuple(sorted([player_id, opp_id]))
+                
+                if game_key not in round_games:
+                    # Determine who was white/black
+                    if color.lower() == 'w':
+                        white_id, black_id = player_id, opp_id
+                        white_name = player_name
+                        # Find opponent name
+                        black_name = df[df['ID'].astype(str) == opp_id]['Name'].iloc[0] if len(df[df['ID'].astype(str) == opp_id]) > 0 else f"Player_{opp_id}"
+                    else:
+                        white_id, black_id = opp_id, player_id
+                        black_name = player_name
+                        # Find opponent name
+                        white_name = df[df['ID'].astype(str) == opp_id]['Name'].iloc[0] if len(df[df['ID'].astype(str) == opp_id]) > 0 else f"Player_{opp_id}"
+                    
+                    round_games[game_key] = {
+                        'round': round_num,
+                        'white_id': white_id,
+                        'white_name': white_name,
+                        'black_id': black_id,
+                        'black_name': black_name
+                    }
+        
+        # Add games to history
+        for game in round_games.values():
+            history_data.append(game)
+            
+        # Add byes
+        for bye_id in round_byes:
+            history_data.append({
+                'round': round_num,
+                'white_id': None,
+                'white_name': None,
+                'black_id': None,
+                'black_name': None,
+                'bye_id': bye_id
+            })
+    
+    history_df = pd.DataFrame(history_data)
+    return standings_df, history_df
+
+
+# -----------------------------
 # Builders from DataFrames
 # -----------------------------
 def build_players(
@@ -313,13 +413,31 @@ def build_players(
     return players, next_round
 
 
+def pair_round_from_csv(
+    csv_file_path: str,
+    last_round: bool = False,
+) -> Tuple[List[Tuple[str, str, str, str]], Optional[str], int]:
+    """
+    Convenience wrapper that reads tournament CSV directly:
+      - parses CSV to extract standings and history
+      - builds Player[]
+      - infers next_round from history
+      - returns pairings, bye_pid, next_round
+    """
+    standings_df, history_df = parse_tournament_csv(csv_file_path)
+    players, next_round = build_players(standings_df, history_df)
+    pairer = USCFPairer(last_round_exception=last_round)
+    pairings, bye_pid = pairer.pair_next_round(players, round_number=next_round)
+    return pairings, bye_pid, next_round
+
+
 def pair_round_from_df(
     standings_df: pd.DataFrame,
     history_df: Optional[pd.DataFrame],
     last_round: bool = False,
 ) -> Tuple[List[Tuple[str, str, str, str]], Optional[str], int]:
     """
-    Convenience wrapper:
+    Original convenience wrapper:
       - builds Player[]
       - infers next_round from history_df (if present)
       - returns pairings, bye_pid, next_round
@@ -328,3 +446,42 @@ def pair_round_from_df(
     pairer = USCFPairer(last_round_exception=last_round)
     pairings, bye_pid = pairer.pair_next_round(players, round_number=next_round)
     return pairings, bye_pid, next_round
+
+
+# -----------------------------
+# Example Usage
+# -----------------------------
+if __name__ == "__main__":
+    # Example of how to use with your CSV format
+    try:
+        pairings, bye_pid, next_round = pair_round_from_csv("tournament.csv")
+        
+        print(f"Pairings for Round {next_round}:")
+        print("=" * 50)
+        
+        for i, (white_id, white_name, black_id, black_name) in enumerate(pairings, 1):
+            print(f"Table {i}: {white_name} (W) vs {black_name} (B)")
+        
+        if bye_pid:
+            print(f"\nBye: Player {bye_pid}")
+        
+        print(f"\nTotal pairings: {len(pairings)}")
+        
+    except FileNotFoundError:
+        print("CSV file not found. Please provide the correct path.")
+    except Exception as e:
+        print(f"Error processing tournament: {e}")
+        
+        
+        
+    
+    
+    # Simple usage with your CSV
+pairings, bye_pid, next_round = pair_round_from_csv("tournament.csv")
+
+print(f"Round {next_round} pairings:")
+for white_id, white_name, black_id, black_name in pairings:
+    print(f"{white_name} (White) vs {black_name} (Black)")
+
+if bye_pid:
+    print(f"Bye: Player {bye_pid}")
