@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Main script to run Swiss tournament pairings.
 
