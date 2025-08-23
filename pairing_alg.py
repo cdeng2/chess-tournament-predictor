@@ -420,17 +420,41 @@ def parse_tournament_csv(csv_file_path: str) -> Tuple[pd.DataFrame, pd.DataFrame
         standings_df: DataFrame with columns [id, name, rating, score]
         history_df: DataFrame with columns [round, white_id, white_name, black_id, black_name, bye_id]
     """
-    # Read the CSV
-    df = pd.read_csv(csv_file_path)
+    # Read the CSV with proper handling of mixed types
+    df = pd.read_csv(csv_file_path, dtype=str)  # Read as strings first
     
-    # Create standings DataFrame
+    # Create standings DataFrame with proper type handling
     standings_data = []
     for _, row in df.iterrows():
+        # Handle ID
+        player_id = str(row['ID']) if pd.notna(row['ID']) else str(len(standings_data) + 1)
+        
+        # Handle Name
+        player_name = str(row['Name']) if pd.notna(row['Name']) else "Unknown Player"
+        
+        # Handle Rating
+        rating_val = None
+        if pd.notna(row['Rating']) and str(row['Rating']).strip() not in ['', 'nan', 'NaN']:
+            try:
+                rating_val = float(row['Rating'])
+                if rating_val == 0:  # Treat 0 as unrated
+                    rating_val = None
+            except (ValueError, TypeError):
+                rating_val = None
+        
+        # Handle Score/Total
+        score_val = 0.0
+        if pd.notna(row['Total']) and str(row['Total']).strip() not in ['', 'nan', 'NaN']:
+            try:
+                score_val = float(row['Total'])
+            except (ValueError, TypeError):
+                score_val = 0.0
+        
         standings_data.append({
-            'id': str(row['ID']),
-            'name': row['Name'],
-            'rating': row['Rating'] if pd.notna(row['Rating']) else None,
-            'score': row['Total']
+            'id': player_id,
+            'name': player_name,
+            'rating': rating_val,
+            'score': score_val
         })
     
     standings_df = pd.DataFrame(standings_data)
@@ -444,19 +468,21 @@ def parse_tournament_csv(csv_file_path: str) -> Tuple[pd.DataFrame, pd.DataFrame
         round_byes = []
         
         for _, row in df.iterrows():
-            player_id = str(row['ID'])
-            player_name = row['Name']
+            player_id = str(row['ID']) if pd.notna(row['ID']) else str(_ + 1)
+            player_name = str(row['Name']) if pd.notna(row['Name']) else "Unknown Player"
             result = row[col]
             
-            if pd.isna(result) or result in ['U---', 'F---']:
+            # Skip if no result or common empty values
+            if pd.isna(result) or str(result).strip() in ['', 'U---', 'F---', 'nan', 'NaN']:
                 continue
                 
-            if result == 'H---':  # Half-point bye
+            if str(result).strip() == 'H---':  # Half-point bye
                 round_byes.append(player_id)
                 continue
                 
             # Parse result like "W29 (b)" or "D6 (w)"
-            match = re.match(r'([WLD])(\d+)\s*\(([wb])\)', str(result))
+            result_str = str(result).strip()
+            match = re.match(r'([WLD])(\d+)\s*\(([wb])\)', result_str)
             if match:
                 result_type, opp_id, color = match.groups()
                 opp_id = str(opp_id)
@@ -470,12 +496,20 @@ def parse_tournament_csv(csv_file_path: str) -> Tuple[pd.DataFrame, pd.DataFrame
                         white_id, black_id = player_id, opp_id
                         white_name = player_name
                         # Find opponent name
-                        black_name = df[df['ID'].astype(str) == opp_id]['Name'].iloc[0] if len(df[df['ID'].astype(str) == opp_id]) > 0 else f"Player_{opp_id}"
+                        opp_row = df[df['ID'].astype(str) == opp_id]
+                        if len(opp_row) > 0:
+                            black_name = str(opp_row['Name'].iloc[0])
+                        else:
+                            black_name = f"Player_{opp_id}"
                     else:
                         white_id, black_id = opp_id, player_id
                         black_name = player_name
                         # Find opponent name
-                        white_name = df[df['ID'].astype(str) == opp_id]['Name'].iloc[0] if len(df[df['ID'].astype(str) == opp_id]) > 0 else f"Player_{opp_id}"
+                        opp_row = df[df['ID'].astype(str) == opp_id]
+                        if len(opp_row) > 0:
+                            white_name = str(opp_row['Name'].iloc[0])
+                        else:
+                            white_name = f"Player_{opp_id}"
                     
                     round_games[game_key] = {
                         'round': round_num,
@@ -524,11 +558,15 @@ def build_players(
     # Copy to avoid mutating caller's frame
     s = standings_df.copy()
 
-    # Basic types
+    # Basic types with robust NaN handling
     s["id"] = s["id"].astype(str)
-    s["name"] = s["name"].astype(str)
+    s["name"] = s["name"].fillna("Unknown Player").astype(str)
+    
+    # Handle rating column with NaN values
     s["rating"] = pd.to_numeric(s["rating"], errors="coerce")
-    s.loc[pd.isna(s["rating"]), "rating"] = None
+    # Keep NaN as None for unrated players
+    
+    # Handle score column
     s["score"] = pd.to_numeric(s["score"], errors="coerce").fillna(0.0)
 
     # Initialize features
@@ -541,26 +579,35 @@ def build_players(
         # Infer next round
         hist_r = pd.to_numeric(history_df["round"], errors="coerce")
         if hist_r.notna().any():
-            next_round = int(hist_r.max()) + 1
+            next_round = int(hist_r.max())
 
         for _, r in history_df.iterrows():
             w = str(r["white_id"]) if pd.notna(r.get("white_id")) else None
             b = str(r["black_id"]) if pd.notna(r.get("black_id")) else None
-            if w and b:
+            if w and b and w != 'nan' and b != 'nan':
                 id2colors.setdefault(w, []).append("W")
                 id2colors.setdefault(b, []).append("B")
                 id2opps.setdefault(w, set()).add(b)
                 id2opps.setdefault(b, set()).add(w)
             if "bye_id" in history_df.columns and pd.notna(r.get("bye_id", None)):
-                had_bye.add(str(r["bye_id"]))
+                bye_id_str = str(r["bye_id"])
+                if bye_id_str != 'nan':
+                    had_bye.add(bye_id_str)
 
     players: List[Player] = []
     for _, r in s.iterrows():
         pid = str(r["id"])
+        rating_val = None
+        if pd.notna(r["rating"]):
+            try:
+                rating_val = int(float(r["rating"]))
+            except (ValueError, TypeError):
+                rating_val = None
+                
         players.append(Player(
             pid=pid,
             name=r["name"],
-            rating=None if r["rating"] is None else int(r["rating"]),
+            rating=rating_val,
             score=float(r["score"]),
             colors=id2colors.get(pid, []),
             opponents=id2opps.get(pid, set()),
