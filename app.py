@@ -1,10 +1,10 @@
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
-from main_backend import get_tournament_pairings, get_tournament_info
+from main_backend import get_tournament_pairings, get_tournament_info #chess code
 import os
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, origins=["http://127.0.0.1:5500"])
 
 @app.route("/")
 def index():
