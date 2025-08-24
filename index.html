@@ -3,17 +3,260 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Test Website</title>
+    <title>Chess Tournament Pairing Predictor</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        form {
+            margin-bottom: 30px;
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        input[type="text"] {
+            width: 100%;
+            padding: 10px;
+            border: 2px solid #ddd;
+            border-radius: 4px;
+            font-size: 16px;
+        }
+        .radio-group {
+            margin: 10px 0;
+        }
+        .radio-group label {
+            display: inline;
+            margin-right: 20px;
+            font-weight: normal;
+        }
+        button {
+            background-color: #2196F3;
+            color: white;
+            padding: 12px 24px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+            transition: background-color 0.2s;
+        }
+        button:hover {
+            background-color: #1976D2;
+        }
+        button:disabled {
+            background-color: #ccc;
+            cursor: not-allowed;
+        }
+        .error {
+            color: #d32f2f;
+            background-color: #ffebee;
+            padding: 10px;
+            border-radius: 4px;
+            margin: 10px 0;
+        }
+        .loading {
+            color: #1976D2;
+            margin: 10px 0;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .loading::after {
+            content: "";
+            width: 20px;
+            height: 20px;
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #1976D2;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        th, td {
+            padding: 15px;
+            text-align: left;
+            border-bottom: 1px solid #ddd;
+        }
+        th {
+            background-color: #f8f8f8;
+            font-weight: bold;
+        }
+        tr:hover {
+            background-color: #f5f5f5;
+        }
+        .bye-player {
+            margin-top: 20px;
+            padding: 15px;
+            background-color: #fff3cd;
+            border: 1px solid #ffeeba;
+            border-radius: 4px;
+            font-weight: bold;
+        }
+    </style>
 </head>
 <body>
-    <h1 id="main-text">Hello World!</h1>
-    <p>If you can see this, your website is running 🎉</p>
-    
-    <button onclick="surprise()">Click Me for a Surprise</button>
+    <div class="container">
+        <h1>Chess Tournament Pairing Predictor</h1>
+        
+        <form id="pairingForm" onsubmit="getPairings(event)">
+            <div class="form-group">
+                <label for="tournamentUrl">Tournament URL:</label>
+                <input type="text" 
+                       id="tournamentUrl" 
+                       name="tournamentUrl" 
+                       placeholder="https://example.com/tournament" 
+                       required>
+            </div>
+            
+            <div class="form-group">
+                <label>Is this the last round?</label>
+                <div class="radio-group">
+                    <input type="radio" id="lastRoundNo" name="isLastRound" value="false" checked>
+                    <label for="lastRoundNo">No</label>
+                    
+                    <input type="radio" id="lastRoundYes" name="isLastRound" value="true">
+                    <label for="lastRoundYes">Yes</label>
+                </div>
+            </div>
+            
+            <button type="submit">Get Pairings</button>
+        </form>
+
+        <div id="error" class="error" style="display: none;"></div>
+        <div id="loading" class="loading" style="display: none;">Calculating pairings...</div>
+
+        <div id="pairingsTable" style="display: none;">
+            <h2>Next Round Pairings</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Board</th>
+                        <th>White Player</th>
+                        <th>Rating</th>
+                        <th>Black Player</th>
+                        <th>Rating</th>
+                    </tr>
+                </thead>
+                <tbody id="pairingsBody"></tbody>
+            </table>
+        </div>
+
+        <div id="byePlayer" class="bye-player" style="display: none;"></div>
+    </div>
 
     <script>
-        function surprise() {
-            document.getElementById("main-text").textContent = "🎉 Surprise! 🎉";
+        async function getPairings(event) {
+            event.preventDefault();
+            
+            const form = document.getElementById('pairingForm');
+            const url = form.tournamentUrl.value;
+            const isLastRound = form.isLastRound.value === 'true';
+            
+            if (!url) {
+                showError('Please enter a tournament URL');
+                return;
+            }
+
+            showLoading(true);
+            hideError();
+            hidePairings();
+
+            try {
+                const response = await fetch('http://localhost:5000/api/pairings', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url, is_last_round: isLastRound })
+                });
+                
+                const data = await response.json();
+
+                if (data.status === 'error') {
+                    throw new Error(data.message);
+                }
+
+                displayPairings(data);
+            } catch (error) {
+                showError(error.message);
+            } finally {
+                showLoading(false);
+            }
+        }
+
+        function displayPairings(data) {
+            const tbody = document.getElementById('pairingsBody');
+            const byePlayerDiv = document.getElementById('byePlayer');
+            const pairingsTable = document.getElementById('pairingsTable');
+
+            // Clear previous data
+            tbody.innerHTML = '';
+            byePlayerDiv.innerHTML = '';
+
+            // Display pairings
+            data.pairings.forEach(pairing => {
+                const row = `
+                    <tr>
+                        <td>${pairing.board}</td>
+                        <td>${pairing.white_name}</td>
+                        <td>${pairing.white_rating || 'Unr'}</td>
+                        <td>${pairing.black_name}</td>
+                        <td>${pairing.black_rating || 'Unr'}</td>
+                    </tr>
+                `;
+                tbody.innerHTML += row;
+            });
+
+            // Display bye player if exists
+            if (data.bye_player) {
+                byePlayerDiv.innerHTML = `
+                    <span>🔄 Bye Player:</span> ${data.bye_player.name} (${data.bye_player.rating || 'Unr'})
+                `;
+                byePlayerDiv.style.display = 'block';
+            } else {
+                byePlayerDiv.style.display = 'none';
+            }
+
+            pairingsTable.style.display = 'block';
+        }
+
+        function showError(message) {
+            const errorDiv = document.getElementById('error');
+            errorDiv.textContent = message;
+            errorDiv.style.display = 'block';
+        }
+
+        function hideError() {
+            document.getElementById('error').style.display = 'none';
+        }
+
+        function showLoading(show) {
+            document.getElementById('loading').style.display = show ? 'block' : 'none';
+        }
+
+        function hidePairings() {
+            document.getElementById('pairingsTable').style.display = 'none';
+            document.getElementById('byePlayer').style.display = 'none';
         }
     </script>
 </body>
