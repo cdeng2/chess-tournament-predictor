@@ -1,676 +1,642 @@
-from __future__ import annotations
-from dataclasses import dataclass
-from typing import List, Optional, Tuple, Dict, Set
+"""
+USCF Swiss System Pairing Algorithm
+
+Implements the official USCF Swiss System pairing rules as specified in the 
+USCF Tournament Director's Handbook and Swiss System rules.
+
+Key USCF Swiss System Principles:
+1. Players with same scores are paired against each other when possible
+2. Players should not play the same opponent twice
+3. Color alternation - players should get equal colors (W/B) when possible
+4. Strong color preferences should be honored when they don't conflict with higher priorities
+5. Bye goes to lowest-rated player who hasn't had one, or lowest score group
+
+Pairing Priority (highest to lowest):
+1. Avoid repeat pairings
+2. Pair within same score groups when possible
+3. Honor due color preferences
+4. Honor strong color preferences
+5. Rating considerations within score groups
+"""
+
 import pandas as pd
-import re
+import math
+from typing import List, Tuple, Optional, Dict, Set
+from dataclasses import dataclass, field
+from enum import Enum
+
+
+class Color(Enum):
+    """Chess piece colors."""
+    WHITE = "W"
+    BLACK = "B"
+    NONE = ""  # For byes or unpaired
+
 
 @dataclass
 class Player:
-    pid: str                 # unique id (string)
+    """Represents a tournament player with Swiss system tracking."""
+    pid: str  # Player ID
     name: str
-    rating: Optional[int]    # None for unrated
-    score: float
-    colors: List[str]        # like ['W','B','W', ...] for completed rounds
-    opponents: Set[str]      # set of opponent pids already faced
+    rating: Optional[int] = None
+    score: float = 0.0
+    colors: List[str] = field(default_factory=list)  # History: ['W', 'B', 'W', ...]
+    opponents: List[str] = field(default_factory=list)  # List of opponent PIDs
     had_bye: bool = False
-    requested_bye: bool = False
-    available: bool = True
-
-    # derived helpers
+    withdrawn: bool = False
+    
+    def __post_init__(self):
+        """Ensure colors and opponents lists are properly initialized."""
+        if not isinstance(self.colors, list):
+            self.colors = []
+        if not isinstance(self.opponents, list):
+            self.opponents = []
+    
     def color_counts(self) -> Tuple[int, int]:
-        w = sum(c == 'W' for c in self.colors)
-        b = sum(c == 'B' for c in self.colors)
-        return w, b
-
+        """Return (white_count, black_count)."""
+        w_count = self.colors.count('W')
+        b_count = self.colors.count('B')
+        return w_count, b_count
+    
+    def color_balance(self) -> int:
+        """Return color balance: positive = more whites, negative = more blacks."""
+        w_count, b_count = self.color_counts()
+        return w_count - b_count
+    
     def last_color(self) -> Optional[str]:
+        """Get the color from the most recent round."""
         return self.colors[-1] if self.colors else None
-
-    def color_imbalance(self) -> int:
-        """Returns difference (White - Black). Positive means more whites."""
-        w, b = self.color_counts()
-        return w - b
-
+    
+    def last_two_colors(self) -> Tuple[Optional[str], Optional[str]]:
+        """Get colors from last two rounds: (second_last, last)."""
+        if len(self.colors) >= 2:
+            return self.colors[-2], self.colors[-1]
+        elif len(self.colors) == 1:
+            return None, self.colors[-1]
+        else:
+            return None, None
+    
     def due_color(self) -> Optional[str]:
         """
-        USCF Rule 29E: Color allocation priorities
-        1. Equalize colors first
-        2. If equal, alternate from last color
-        3. Give priority to player who is more behind in their due color
+        Determine if player is due a particular color based on balance.
+        Returns 'W' if due white, 'B' if due black, None if balanced.
         """
-        imbalance = self.color_imbalance()
-        
-        # Strong due color (imbalance >= 2)
-        if imbalance >= 2:
-            return 'B'
-        if imbalance <= -2:
+        balance = self.color_balance()
+        if balance < -1:  # More blacks than whites by 2+
             return 'W'
-            
-        # Mild due color (imbalance = 1)
-        if imbalance == 1:
+        elif balance > 1:  # More whites than blacks by 2+
             return 'B'
-        if imbalance == -1:
-            return 'W'
-            
-        # Equal colors - alternate from last
-        if self.colors:
-            return 'B' if self.colors[-1] == 'W' else 'W'
-            
         return None
-
+    
     def strong_color_preference(self) -> Optional[str]:
-        """Returns color if player has strong preference (imbalance >= 2 or would make 3 in a row)"""
-        imbalance = self.color_imbalance()
+        """
+        Determine if player has a strong color preference.
+        Strong preference = had same color last 2 rounds or significant imbalance.
+        """
+        # Check last two colors
+        second_last, last = self.last_two_colors()
+        if second_last and last and second_last == last:
+            # Had same color twice in a row, strongly prefer opposite
+            return 'B' if last == 'W' else 'W'
         
-        if imbalance >= 2:
-            return 'B'
-        if imbalance <= -2:
-            return 'W'
-            
-        # Avoid 3 in a row
-        if len(self.colors) >= 2 and self.colors[-1] == self.colors[-2]:
-            return 'B' if self.colors[-1] == 'W' else 'W'
-            
+        # Check for significant imbalance (3+ difference)
+        balance = self.color_balance()
+        if balance >= 3:
+            return 'B'  # Strongly prefer black
+        elif balance <= -3:
+            return 'W'  # Strongly prefer white
+        
         return None
-
-    def would_make_three_in_row(self, color: str) -> bool:
-        """Check if assigning this color would make 3 in a row"""
-        if len(self.colors) >= 2:
-            return self.colors[-1] == color and self.colors[-2] == color
-        return False
-
-    def color_preference_strength(self) -> int:
+    
+    def preferred_color(self) -> Optional[str]:
         """
-        Return strength of color preference:
-        3 = Strong (would prevent 3 in a row or fix major imbalance)
-        2 = Due (imbalance of 1 or normal alternation)
-        1 = Mild preference
-        0 = No preference
+        Get preferred color considering both due and strong preferences.
+        Due color takes priority over strong preference.
         """
-        imbalance = self.color_imbalance()
+        due = self.due_color()
+        if due:
+            return due
+        return self.strong_color_preference()
+    
+    def has_played(self, opponent_id: str) -> bool:
+        """Check if this player has already played against the given opponent."""
+        return opponent_id in self.opponents
+    
+    def rounds_played(self) -> int:
+        """Number of rounds actually played (excludes byes)."""
+        return len([c for c in self.colors if c in ['W', 'B']])
+
+
+@dataclass
+class ScoreGroup:
+    """Group of players with the same score."""
+    score: float
+    players: List[Player] = field(default_factory=list)
+    
+    def __post_init__(self):
+        """Sort players by rating (highest first) for tiebreaking."""
+        self.players.sort(key=lambda p: -(p.rating or 0))
+    
+    def size(self) -> int:
+        """Number of players in this score group."""
+        return len(self.players)
+    
+    def is_odd(self) -> bool:
+        """True if this score group has an odd number of players."""
+        return self.size() % 2 == 1
+
+
+class SwissPairingEngine:
+    """Main Swiss system pairing engine following USCF rules."""
+    
+    def __init__(self, players: List[Player]):
+        self.players = players
+        self.active_players = [p for p in players if not p.withdrawn]
+        self.pairings: List[Tuple[str, str]] = []  # (white_pid, black_pid)
+        self.bye_player: Optional[str] = None
+        self.unpaired_players: Set[str] = set(p.pid for p in self.active_players)
+    
+    def create_score_groups(self) -> List[ScoreGroup]:
+        """Group players by score, sorted from highest to lowest score."""
+        score_dict: Dict[float, List[Player]] = {}
         
-        # Prevent 3 in a row (highest priority after avoiding repeats)
-        if len(self.colors) >= 2 and self.colors[-1] == self.colors[-2]:
-            return 3
-            
-        # Major imbalance
-        if abs(imbalance) >= 2:
-            return 3
-            
-        # Minor imbalance  
-        if abs(imbalance) == 1:
-            return 2
-            
-        # Alternation preference
-        if self.colors:
-            return 1
-            
-        return 0
-
-
-class USCFPairer:
-    """
-    Strict USCF Swiss System pairer following official rules:
-    - Rule 27: Basic Swiss System pairing within score groups
-    - Rule 28: Transposition rules for avoiding repeats
-    - Rule 29: Color allocation rules
-    - Rule 30: Bye assignment rules
-    """
-
-    def __init__(self, last_round_exception: bool = False):
-        self.last_round_exception = last_round_exception
-
-    @staticmethod
-    def _rating(p: Player) -> int:
-        """Unrated players treated as rating 0 for pairing purposes"""
-        return p.rating if p.rating is not None else 0
-
-    @staticmethod
-    def _sort_within_group(p: Player):
-        """Within same score: rating desc, then name alphabetically"""
-        return (-USCFPairer._rating(p), p.name, p.pid)
-
-    @staticmethod
-    def _group_by_score(players: List[Player]) -> Dict[float, List[Player]]:
-        """Group players by score, sort within groups by rating"""
-        buckets: Dict[float, List[Player]] = {}
-        for p in players:
-            buckets.setdefault(p.score, []).append(p)
+        for player in self.active_players:
+            score = player.score
+            if score not in score_dict:
+                score_dict[score] = []
+            score_dict[score].append(player)
         
-        # Sort each group by rating desc, then name
-        for s in buckets:
-            buckets[s].sort(key=USCFPairer._sort_within_group)
-            
-        # Return groups high-score to low-score
-        return dict(sorted(buckets.items(), key=lambda kv: -kv[0]))
-
-    @staticmethod
-    def _can_meet(a: Player, b: Player) -> bool:
-        """Check if two players can be paired (haven't played before)"""
-        return (b.pid not in a.opponents) and (a.pid not in b.opponents)
-
-    def _assign_colors(self, a: Player, b: Player) -> Tuple[Player, Player]:
+        # Create ScoreGroup objects and sort by score (highest first)
+        score_groups = [ScoreGroup(score, players) for score, players in score_dict.items()]
+        score_groups.sort(key=lambda sg: -sg.score)
+        
+        return score_groups
+    
+    def find_bye_player(self, score_groups: List[ScoreGroup]) -> Optional[str]:
         """
-        USCF Rule 29E: Color assignment with proper priorities
-        Returns (white_player, black_player)
+        Find the player who should receive the bye according to USCF rules.
+        Bye goes to the lowest-rated player in the lowest score group who hasn't had a bye.
         """
-        a_pref = a.strong_color_preference()
-        b_pref = b.strong_color_preference()
+        if len(self.active_players) % 2 == 0:
+            return None  # Even number of players, no bye needed
         
-        # Rule 29E1: Honor strong preferences when they don't conflict
-        if a_pref and not b_pref:
-            if a_pref == 'W':
-                return (a, b)
-            else:
-                return (b, a)
-                
-        if b_pref and not a_pref:
-            if b_pref == 'W':
-                return (b, a)
-            else:
-                return (a, b)
+        # Start from lowest score group and work up
+        for score_group in reversed(score_groups):
+            # Find players who haven't had a bye yet
+            no_bye_players = [p for p in score_group.players if not p.had_bye]
+            if no_bye_players:
+                # Give bye to lowest-rated player without a bye
+                bye_player = min(no_bye_players, key=lambda p: p.rating or 0)
+                return bye_player.pid
         
-        # Rule 29E2: If both have strong preferences and they conflict
-        if a_pref and b_pref and a_pref != b_pref:
-            # Give white to whoever wants it more urgently
-            a_strength = a.color_preference_strength()
-            b_strength = b.color_preference_strength()
-            
-            if a_pref == 'W' and (a_strength > b_strength or 
-                                (a_strength == b_strength and self._rating(a) >= self._rating(b))):
-                return (a, b)
-            elif b_pref == 'W' and (b_strength > a_strength or 
-                                  (b_strength == a_strength and self._rating(b) >= self._rating(a))):
-                return (b, a)
+        # If everyone has had a bye, give it to lowest-rated in lowest score group
+        if score_groups:
+            lowest_group = score_groups[-1]
+            if lowest_group.players:
+                bye_player = min(lowest_group.players, key=lambda p: p.rating or 0)
+                return bye_player.pid
         
-        # Rule 29E3: Use due colors if no strong preferences
-        a_due = a.due_color()
-        b_due = b.due_color()
+        return None
+    
+    def can_pair(self, p1: Player, p2: Player) -> bool:
+        """
+        Check if two players can be paired according to USCF rules.
+        Players cannot be paired if they've already played each other.
+        """
+        return not p1.has_played(p2.pid) and not p2.has_played(p1.pid)
+    
+    def color_assignment_score(self, p1: Player, p2: Player, p1_white: bool) -> float:
+        """
+        Score a potential color assignment for pairing quality.
+        Higher score = better assignment.
         
-        if a_due == 'W' and b_due == 'B':
-            return (a, b)
-        elif a_due == 'B' and b_due == 'W':
-            return (b, a)
-        elif a_due == 'W' and not b_due:
-            return (a, b)
-        elif b_due == 'W' and not a_due:
-            return (b, a)
+        Factors considered:
+        1. Due colors (highest priority)
+        2. Strong color preferences  
+        3. Color balance
+        4. Avoiding same color twice in a row
+        """
+        white_player = p1 if p1_white else p2
+        black_player = p2 if p1_white else p1
         
-        # Rule 29E4: Avoid making 3 in a row if possible
-        if not a.would_make_three_in_row('W') and b.would_make_three_in_row('W'):
-            return (a, b)
-        elif not b.would_make_three_in_row('W') and a.would_make_three_in_row('W'):
-            return (b, a)
+        score = 0.0
         
-        # Rule 29E5: Final tiebreaker - higher rated player gets white
-        return (a, b) if self._rating(a) >= self._rating(b) else (b, a)
-
-    def _try_basic_pairing(self, players: List[Player]) -> Optional[List[Tuple[Player, Player]]]:
-        """Try basic top-half vs bottom-half pairing"""
-        if len(players) % 2 != 0:
-            return None
-            
-        n = len(players)
-        half = n // 2
+        # Due colors (highest priority - 1000 points each)
+        if white_player.due_color() == 'W':
+            score += 1000
+        elif white_player.due_color() == 'B':
+            score -= 1000
+        
+        if black_player.due_color() == 'B':
+            score += 1000
+        elif black_player.due_color() == 'W':
+            score -= 1000
+        
+        # Strong color preferences (500 points each)
+        white_strong_pref = white_player.strong_color_preference()
+        if white_strong_pref == 'W':
+            score += 500
+        elif white_strong_pref == 'B':
+            score -= 500
+        
+        black_strong_pref = black_player.strong_color_preference()
+        if black_strong_pref == 'B':
+            score += 500
+        elif black_strong_pref == 'W':
+            score -= 500
+        
+        # Color balance improvement (100 points per improvement)
+        white_balance = white_player.color_balance()
+        black_balance = black_player.color_balance()
+        
+        # Reward moves toward better balance
+        if white_balance > 0:  # Too many whites, so giving white is bad
+            score -= abs(white_balance) * 100
+        else:  # Giving white helps balance
+            score += abs(white_balance) * 100
+        
+        if black_balance < 0:  # Too many blacks, so giving black is bad
+            score -= abs(black_balance) * 100
+        else:  # Giving black helps balance
+            score += abs(black_balance) * 100
+        
+        # Avoid same color as last round (50 points)
+        if white_player.last_color() != 'W':
+            score += 50
+        else:
+            score -= 50
+        
+        if black_player.last_color() != 'B':
+            score += 50
+        else:
+            score -= 50
+        
+        return score
+    
+    def determine_colors(self, p1: Player, p2: Player) -> Tuple[str, str]:
+        """
+        Determine optimal color assignment for two players.
+        Returns (p1_color, p2_color).
+        """
+        # Try both color assignments and pick the better one
+        p1_white_score = self.color_assignment_score(p1, p2, True)
+        p1_black_score = self.color_assignment_score(p1, p2, False)
+        
+        if p1_white_score >= p1_black_score:
+            return ('W', 'B')  # p1 gets white, p2 gets black
+        else:
+            return ('B', 'W')  # p1 gets black, p2 gets white
+    
+    def pair_score_group(self, score_group: ScoreGroup) -> List[Tuple[Player, Player]]:
+        """
+        Pair players within a score group using a greedy approach.
+        Returns list of (player1, player2) pairs.
+        """
+        available = score_group.players[:]
         pairs = []
         
-        for i in range(half):
-            top_player = players[i]
-            bottom_player = players[half + i]
+        while len(available) >= 2:
+            # Take the highest-rated unpaired player
+            p1 = available[0]
+            available.remove(p1)
             
-            if not self._can_meet(top_player, bottom_player):
-                return None
-                
-            pairs.append((top_player, bottom_player))
+            # Find the best opponent for p1
+            best_opponent = None
+            best_score = -float('inf')
             
-        return pairs
-
-    def _try_transpositions(self, players: List[Player]) -> Optional[List[Tuple[Player, Player]]]:
-        """
-        USCF Rule 28: Try allowable transpositions to avoid repeat pairings
-        """
-        if len(players) % 2 != 0:
-            return None
-            
-        n = len(players)
-        half = n // 2
-        top_half = players[:half]
-        bottom_half = players[half:]
-        
-        # Try different arrangements of bottom half players
-        for i in range(len(bottom_half)):
-            # Rotate bottom half
-            rotated_bottom = bottom_half[i:] + bottom_half[:i]
-            pairs = []
-            valid = True
-            
-            for j in range(half):
-                if not self._can_meet(top_half[j], rotated_bottom[j]):
-                    valid = False
-                    break
-                pairs.append((top_half[j], rotated_bottom[j]))
-                
-            if valid:
-                return pairs
-        
-        # Try swapping adjacent pairs in bottom half
-        for i in range(len(bottom_half) - 1):
-            test_bottom = bottom_half.copy()
-            test_bottom[i], test_bottom[i + 1] = test_bottom[i + 1], test_bottom[i]
-            
-            pairs = []
-            valid = True
-            
-            for j in range(half):
-                if not self._can_meet(top_half[j], test_bottom[j]):
-                    valid = False
-                    break
-                pairs.append((top_half[j], test_bottom[j]))
-                
-            if valid:
-                return pairs
-                
-        return None
-
-    def _pair_score_group(self, players: List[Player]) -> Tuple[List[Tuple[Player, Player]], Optional[Player]]:
-        """
-        Pair a single score group, returning pairs and any floater
-        """
-        if len(players) == 0:
-            return [], None
-            
-        if len(players) == 1:
-            return [], players[0]
-        
-        # Try basic pairing first
-        pairs = self._try_basic_pairing(players)
-        if pairs:
-            return pairs, None
-            
-        # Try transpositions
-        pairs = self._try_transpositions(players)
-        if pairs:
-            return pairs, None
-            
-        # If we can't pair everyone, float the lowest rated player
-        if len(players) % 2 == 1:
-            floater = players[-1]  # Already sorted by rating desc, so last is lowest
-            remaining = players[:-1]
-            
-            pairs = self._try_basic_pairing(remaining)
-            if not pairs:
-                pairs = self._try_transpositions(remaining)
-                
-            return pairs or [], floater
-            
-        # Even number but can't pair due to repeat opponents
-        # Float lowest rated and try again
-        floater = players[-1]
-        remaining = players[:-1]
-        pairs, additional_floater = self._pair_score_group(remaining)
-        
-        if additional_floater:
-            # Multiple floaters - this shouldn't happen in well-formed tournaments
-            return pairs, floater  # Keep the originally selected floater
-            
-        return pairs, floater
-
-    def _assign_bye(self, players: List[Player]) -> Optional[str]:
-        """
-        USCF Rule 30: Bye assignment
-        - Lowest rated player who hasn't had a bye
-        - If all have had byes, lowest rated overall
-        """
-        # First try players who haven't had a bye
-        candidates = [p for p in players if not p.had_bye and p.available]
-        
-        if not candidates:
-            # All have had byes, so anyone is eligible
-            candidates = [p for p in players if p.available]
-            
-        if not candidates:
-            return None
-            
-        # Lowest rated gets the bye
-        bye_player = min(candidates, key=lambda p: (self._rating(p), p.name))
-        return bye_player.pid
-
-    def pair_next_round(
-        self,
-        players: List[Player],
-        round_number: int,
-    ) -> Tuple[List[Tuple[str, str, str, str]], Optional[str]]:
-        """
-        Main pairing algorithm following USCF rules
-        """
-        # Filter active players
-        active_players = [p for p in players if p.available and not p.requested_bye]
-        
-        if len(active_players) == 0:
-            return [], None
-            
-        total_odd = len(active_players) % 2 == 1
-        groups = self._group_by_score(active_players)
-        
-        all_pairings: List[Tuple[str, str, str, str]] = []
-        floater: Optional[Player] = None
-        
-        # Process each score group from highest to lowest
-        for score, group_players in groups.items():
-            working_group = group_players.copy()
-            
-            # Add floater from previous group if exists
-            if floater:
-                # Try to pair floater with someone from this group
-                candidates = [p for p in working_group if self._can_meet(floater, p)]
-                
-                if candidates:
-                    # Pair with highest rated available opponent
-                    opponent = candidates[0]  # Already sorted by rating desc
-                    working_group.remove(opponent)
+            for p2 in available:
+                if self.can_pair(p1, p2):
+                    # Score this potential pairing
+                    pairing_score = self.color_assignment_score(p1, p2, True)
+                    pairing_score += self.color_assignment_score(p1, p2, False)
                     
-                    white, black = self._assign_colors(floater, opponent)
-                    all_pairings.append((white.pid, white.name, black.pid, black.name))
-                    floater = None
-                # If can't pair floater here, continue to next group
+                    # Slight preference for closer ratings
+                    if p1.rating and p2.rating:
+                        rating_diff = abs(p1.rating - p2.rating)
+                        pairing_score -= rating_diff * 0.01  # Small penalty for rating differences
+                    
+                    if pairing_score > best_score:
+                        best_score = pairing_score
+                        best_opponent = p2
             
-            # Pair remaining players in this group
-            group_pairs, new_floater = self._pair_score_group(working_group)
-            
-            # Add successful pairings
-            for p1, p2 in group_pairs:
-                white, black = self._assign_colors(p1, p2)
-                all_pairings.append((white.pid, white.name, black.pid, black.name))
-            
-            # Handle floater
-            if floater and new_floater:
-                # Two floaters - try to pair them
-                if self._can_meet(floater, new_floater):
-                    white, black = self._assign_colors(floater, new_floater)
-                    all_pairings.append((white.pid, white.name, black.pid, black.name))
-                    floater = None
-                else:
-                    # Can't pair floaters - keep the one from higher score group
-                    floater = floater  # Keep existing floater
-            elif new_floater:
-                floater = new_floater
-        
-        # Assign bye if needed
-        bye_pid = None
-        if total_odd:
-            if floater:
-                bye_pid = floater.pid
+            if best_opponent:
+                available.remove(best_opponent)
+                pairs.append((p1, best_opponent))
             else:
-                bye_pid = self._assign_bye(active_players)
+                # No valid opponent found - will need to drop down or get bye
+                break
         
-        return all_pairings, bye_pid
-
-
-# -----------------------------
-# CSV Parser for Tournament Data
-# -----------------------------
-def parse_tournament_csv(csv_file_path: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Parse a tournament CSV in the format you provided and return standings_df and history_df.
+        return pairs
     
-    Expected CSV format:
-    - Columns: #, Name, ID, Rating, Fed, Rd 1, Rd 2, ..., Total
-    - Round results like: "W29 (b)", "D6 (w)", "L2 (b)", "H---", "U---", etc.
+    def try_cross_group_pairing(self, upper_group: ScoreGroup, lower_group: ScoreGroup) -> List[Tuple[Player, Player]]:
+        """
+        Attempt to pair players from different score groups.
+        Used when a score group has odd number and can't pair internally.
+        """
+        pairs = []
+        upper_available = upper_group.players[:]
+        lower_available = lower_group.players[:]
+        
+        # Try to pair lowest from upper group with highest from lower group
+        while upper_available and lower_available:
+            # Take lowest-rated from upper group
+            upper_player = min(upper_available, key=lambda p: p.rating or 0)
+            upper_available.remove(upper_player)
+            
+            # Find best match from lower group
+            best_opponent = None
+            best_score = -float('inf')
+            
+            for lower_player in lower_available:
+                if self.can_pair(upper_player, lower_player):
+                    pairing_score = self.color_assignment_score(upper_player, lower_player, True)
+                    pairing_score += self.color_assignment_score(upper_player, lower_player, False)
+                    
+                    if pairing_score > best_score:
+                        best_score = pairing_score
+                        best_opponent = lower_player
+            
+            if best_opponent:
+                lower_available.remove(best_opponent)
+                pairs.append((upper_player, best_opponent))
+                break  # Only do one cross-group pairing at a time
+        
+        return pairs
+    
+    def generate_pairings(self) -> Tuple[List[Tuple[str, str, str, str]], Optional[str]]:
+        """
+        Generate pairings for the next round according to USCF Swiss system rules.
+        
+        Returns:
+            Tuple of (pairings, bye_player_id) where:
+            - pairings: List of (white_id, white_name, black_id, black_name)
+            - bye_player_id: ID of player receiving bye, or None
+        """
+        score_groups = self.create_score_groups()
+        
+        # Assign bye first
+        bye_pid = self.find_bye_player(score_groups)
+        if bye_pid:
+            self.bye_player = bye_pid
+            self.unpaired_players.remove(bye_pid)
+            # Remove bye player from their score group
+            for group in score_groups:
+                group.players = [p for p in group.players if p.pid != bye_pid]
+        
+        # Pair each score group
+        all_pairs = []
+        unpaired_from_groups = []
+        
+        for i, group in enumerate(score_groups):
+            if group.size() == 0:
+                continue
+            
+            pairs = self.pair_score_group(group)
+            all_pairs.extend(pairs)
+            
+            # Track any unpaired players from this group
+            paired_pids = set()
+            for p1, p2 in pairs:
+                paired_pids.add(p1.pid)
+                paired_pids.add(p2.pid)
+            
+            unpaired = [p for p in group.players if p.pid not in paired_pids]
+            if unpaired:
+                unpaired_from_groups.extend(unpaired)
+        
+        # Try to pair any unpaired players from different groups
+        while len(unpaired_from_groups) >= 2:
+            p1 = unpaired_from_groups.pop(0)
+            best_match = None
+            best_score = -float('inf')
+            
+            for i, p2 in enumerate(unpaired_from_groups):
+                if self.can_pair(p1, p2):
+                    score = self.color_assignment_score(p1, p2, True)
+                    score += self.color_assignment_score(p1, p2, False)
+                    
+                    if score > best_score:
+                        best_score = score
+                        best_match = (p2, i)
+            
+            if best_match:
+                p2, idx = best_match
+                unpaired_from_groups.pop(idx)
+                all_pairs.append((p1, p2))
+        
+        # Convert pairs to final format with color assignments
+        final_pairings = []
+        for p1, p2 in all_pairs:
+            p1_color, p2_color = self.determine_colors(p1, p2)
+            
+            if p1_color == 'W':
+                white_player, black_player = p1, p2
+            else:
+                white_player, black_player = p2, p1
+            
+            final_pairings.append((
+                white_player.pid,
+                white_player.name,
+                black_player.pid,
+                black_player.name
+            ))
+        
+        return final_pairings, bye_pid
+
+
+def parse_tournament_csv(csv_file: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Parse tournament CSV file and split into standings and history.
     
     Returns:
-        standings_df: DataFrame with columns [id, name, rating, score]
-        history_df: DataFrame with columns [round, white_id, white_name, black_id, black_name, bye_id]
+        Tuple of (standings_df, history_df) where:
+        - standings_df: Current standings with Name, ID, Rating, Total columns
+        - history_df: Round-by-round results with player IDs and opponents
     """
-    # Read the CSV with proper handling of mixed types
-    df = pd.read_csv(csv_file_path, dtype=str)  # Read as strings first
+    df = pd.read_csv(csv_file)
     
-    # Create standings DataFrame with proper type handling
-    standings_data = []
-    for _, row in df.iterrows():
-        # Handle ID
-        player_id = str(row['ID']) if pd.notna(row['ID']) else str(len(standings_data) + 1)
-        
-        # Handle Name
-        player_name = str(row['Name']) if pd.notna(row['Name']) else "Unknown Player"
-        
-        # Handle Rating
-        rating_val = None
-        if pd.notna(row['Rating']) and str(row['Rating']).strip() not in ['', 'nan', 'NaN']:
-            try:
-                rating_val = float(row['Rating'])
-                if rating_val == 0:  # Treat 0 as unrated
-                    rating_val = None
-            except (ValueError, TypeError):
-                rating_val = None
-        
-        # Handle Score/Total
-        score_val = 0.0
-        if pd.notna(row['Total']) and str(row['Total']).strip() not in ['', 'nan', 'NaN']:
-            try:
-                score_val = float(row['Total'])
-            except (ValueError, TypeError):
-                score_val = 0.0
-        
-        standings_data.append({
-            'id': player_id,
-            'name': player_name,
-            'rating': rating_val,
-            'score': score_val
-        })
-    
-    standings_df = pd.DataFrame(standings_data)
-    
-    # Create history DataFrame by parsing round columns
-    history_data = []
+    # Identify standings columns (non-round columns)
     round_cols = [col for col in df.columns if col.startswith('Rd ')]
+    standings_cols = [col for col in df.columns if col not in round_cols]
     
-    for round_num, col in enumerate(round_cols, 1):
-        round_games = {}  # Track games for this round
-        round_byes = []
-        
-        for _, row in df.iterrows():
-            player_id = str(row['ID']) if pd.notna(row['ID']) else str(_ + 1)
-            player_name = str(row['Name']) if pd.notna(row['Name']) else "Unknown Player"
-            result = row[col]
+    standings_df = df[standings_cols].copy()
+    
+    # Create history dataframe
+    history_data = []
+    for _, row in df.iterrows():
+        player_id = str(row['ID'])
+        for round_col in round_cols:
+            round_num = int(round_col.split()[1])
+            result = str(row[round_col]).strip()
             
-            # Skip if no result or common empty values
-            if pd.isna(result) or str(result).strip() in ['', 'U---', 'F---', 'nan', 'NaN']:
-                continue
+            if result and result not in ['', 'nan', 'NaN']:
+                # Parse result (format examples: "W15", "B23", "L7", "D12", "H---" for bye)
+                color = ''
+                opponent_id = ''
+                outcome = ''
                 
-            if str(result).strip() == 'H---':  # Half-point bye
-                round_byes.append(player_id)
-                continue
+                if result.startswith(('W', 'B', 'L', 'D')):
+                    if result[0] in ['W', 'B']:
+                        color = result[0]
+                        opponent_id = result[1:]
+                        outcome = 'W' if result.startswith('W') else 'L'
+                    elif result[0] == 'L':
+                        # Loss - need to determine color from opponent's record
+                        opponent_id = result[1:]
+                        outcome = 'L'
+                    elif result[0] == 'D':
+                        # Draw - need to determine color from opponent's record  
+                        opponent_id = result[1:]
+                        outcome = 'D'
+                elif result.startswith('H') or 'bye' in result.lower():
+                    # Bye or forfeit win
+                    color = ''
+                    opponent_id = ''
+                    outcome = 'H'
                 
-            # Parse result like "W29 (b)" or "D6 (w)"
-            result_str = str(result).strip()
-            match = re.match(r'([WLD])(\d+)\s*\(([wb])\)', result_str)
-            if match:
-                result_type, opp_id, color = match.groups()
-                opp_id = str(opp_id)
-                
-                # Create a game key to avoid duplicates
-                game_key = tuple(sorted([player_id, opp_id]))
-                
-                if game_key not in round_games:
-                    # Determine who was white/black
-                    if color.lower() == 'w':
-                        white_id, black_id = player_id, opp_id
-                        white_name = player_name
-                        # Find opponent name
-                        opp_row = df[df['ID'].astype(str) == opp_id]
-                        if len(opp_row) > 0:
-                            black_name = str(opp_row['Name'].iloc[0])
-                        else:
-                            black_name = f"Player_{opp_id}"
-                    else:
-                        white_id, black_id = opp_id, player_id
-                        black_name = player_name
-                        # Find opponent name
-                        opp_row = df[df['ID'].astype(str) == opp_id]
-                        if len(opp_row) > 0:
-                            white_name = str(opp_row['Name'].iloc[0])
-                        else:
-                            white_name = f"Player_{opp_id}"
-                    
-                    round_games[game_key] = {
+                if opponent_id and opponent_id.isdigit():
+                    history_data.append({
+                        'player_id': player_id,
                         'round': round_num,
-                        'white_id': white_id,
-                        'white_name': white_name,
-                        'black_id': black_id,
-                        'black_name': black_name
-                    }
-        
-        # Add games to history
-        for game in round_games.values():
-            history_data.append(game)
-            
-        # Add byes
-        for bye_id in round_byes:
-            history_data.append({
-                'round': round_num,
-                'white_id': None,
-                'white_name': None,
-                'black_id': None,
-                'black_name': None,
-                'bye_id': bye_id
-            })
+                        'opponent_id': opponent_id,
+                        'color': color,
+                        'result': outcome
+                    })
+                elif outcome == 'H':  # Bye
+                    history_data.append({
+                        'player_id': player_id,
+                        'round': round_num,
+                        'opponent_id': '',
+                        'color': '',
+                        'result': 'H'
+                    })
     
     history_df = pd.DataFrame(history_data)
+    
     return standings_df, history_df
 
 
-# -----------------------------
-# Builders from DataFrames
-# -----------------------------
-def build_players(
-    standings_df: pd.DataFrame,
-    history_df: Optional[pd.DataFrame] = None,
-) -> Tuple[List[Player], int]:
+def build_players(standings_df: pd.DataFrame, history_df: pd.DataFrame) -> Tuple[List[Player], int]:
     """
-    Build Player[] from:
-      standings_df columns (any reasonable naming is fine in main.py; normalize there to):
-        - id, name, rating, score
-      history_df columns (optional but recommended):
-        - round, white_id, white_name, black_id, black_name
-        - optional: bye_id
-
-    Returns: (players, next_round)
+    Build Player objects from standings and history data.
+    
+    Returns:
+        Tuple of (players_list, next_round_number)
     """
-    # Copy to avoid mutating caller's frame
-    s = standings_df.copy()
-
-    # Basic types with robust NaN handling
-    s["id"] = s["id"].astype(str)
-    s["name"] = s["name"].fillna("Unknown Player").astype(str)
+    players = []
     
-    # Handle rating column with NaN values
-    s["rating"] = pd.to_numeric(s["rating"], errors="coerce")
-    # Keep NaN as None for unrated players
+    # Determine next round number
+    if not history_df.empty:
+        next_round = history_df['round'].max() + 1
+    else:
+        next_round = 1
     
-    # Handle score column
-    s["score"] = pd.to_numeric(s["score"], errors="coerce").fillna(0.0)
-
-    # Initialize features
-    id2colors: Dict[str, List[str]] = {pid: [] for pid in s["id"]}
-    id2opps: Dict[str, Set[str]] = {pid: set() for pid in s["id"]}
-    had_bye: Set[str] = set()
-    next_round = 1
-
-    if history_df is not None and not history_df.empty:
-        # Infer next round
-        hist_r = pd.to_numeric(history_df["round"], errors="coerce")
-        if hist_r.notna().any():
-            next_round = int(hist_r.max())
-
-        for _, r in history_df.iterrows():
-            w = str(r["white_id"]) if pd.notna(r.get("white_id")) else None
-            b = str(r["black_id"]) if pd.notna(r.get("black_id")) else None
-            if w and b and w != 'nan' and b != 'nan':
-                id2colors.setdefault(w, []).append("W")
-                id2colors.setdefault(b, []).append("B")
-                id2opps.setdefault(w, set()).add(b)
-                id2opps.setdefault(b, set()).add(w)
-            if "bye_id" in history_df.columns and pd.notna(r.get("bye_id", None)):
-                bye_id_str = str(r["bye_id"])
-                if bye_id_str != 'nan':
-                    had_bye.add(bye_id_str)
-
-    players: List[Player] = []
-    for _, r in s.iterrows():
-        pid = str(r["id"])
-        rating_val = None
-        if pd.notna(r["rating"]):
-            try:
-                rating_val = int(float(r["rating"]))
-            except (ValueError, TypeError):
-                rating_val = None
+    for _, row in standings_df.iterrows():
+        pid = str(row['ID'])
+        name = str(row['Name'])
+        rating = row['Rating'] if pd.notna(row['Rating']) else None
+        if rating is not None:
+            rating = int(rating)
+        
+        score = float(row['Total']) if pd.notna(row['Total']) else 0.0
+        
+        # Get player's history
+        player_history = history_df[history_df['player_id'] == pid].sort_values('round')
+        
+        colors = []
+        opponents = []
+        had_bye = False
+        
+        for _, hist_row in player_history.iterrows():
+            result = hist_row['result']
+            if result == 'H':  # Bye
+                had_bye = True
+                colors.append('')  # No color for bye
+            else:
+                color = hist_row['color']
+                if not color:
+                    # Need to infer color from opponent's record
+                    opponent_id = hist_row['opponent_id']
+                    opponent_history = history_df[
+                        (history_df['player_id'] == opponent_id) & 
+                        (history_df['round'] == hist_row['round'])
+                    ]
+                    if not opponent_history.empty:
+                        opp_color = opponent_history.iloc[0]['color']
+                        color = 'B' if opp_color == 'W' else 'W'
+                    else:
+                        color = 'W'  # Default assumption
                 
-        players.append(Player(
+                colors.append(color)
+                opponents.append(hist_row['opponent_id'])
+        
+        player = Player(
             pid=pid,
-            name=r["name"],
-            rating=rating_val,
-            score=float(r["score"]),
-            colors=id2colors.get(pid, []),
-            opponents=id2opps.get(pid, set()),
-            had_bye=(pid in had_bye),
-        ))
+            name=name,
+            rating=rating,
+            score=score,
+            colors=colors,
+            opponents=opponents,
+            had_bye=had_bye
+        )
+        players.append(player)
+    
     return players, next_round
 
 
-def pair_round_from_csv(
-    csv_file_path: str,
-    last_round: bool = False,
-) -> Tuple[List[Tuple[str, str, str, str]], Optional[str], int]:
+def pair_round_from_csv(csv_file: str, last_round: bool = False) -> Tuple[List[Tuple[str, str, str, str]], Optional[str], int]:
     """
-    Convenience wrapper that reads tournament CSV directly:
-      - parses CSV to extract standings and history
-      - builds Player[]
-      - infers next_round from history
-      - returns pairings, bye_pid, next_round
-    """
-    standings_df, history_df = parse_tournament_csv(csv_file_path)
-    players, next_round = build_players(standings_df, history_df)
-    pairer = USCFPairer(last_round_exception=last_round)
-    pairings, bye_pid = pairer.pair_next_round(players, round_number=next_round)
-    return pairings, bye_pid, next_round
-
-
-def pair_round_from_df(
-    standings_df: pd.DataFrame,
-    history_df: Optional[pd.DataFrame],
-    last_round: bool = False,
-) -> Tuple[List[Tuple[str, str, str, str]], Optional[str], int]:
-    """
-    Original convenience wrapper:
-      - builds Player[]
-      - infers next_round from history_df (if present)
-      - returns pairings, bye_pid, next_round
-    """
-    players, next_round = build_players(standings_df, history_df)
-    pairer = USCFPairer(last_round_exception=last_round)
-    pairings, bye_pid = pairer.pair_next_round(players, round_number=next_round)
-    return pairings, bye_pid, next_round
-
-
-# -----------------------------
-# Example Usage
-# -----------------------------
-if __name__ == "__main__":
-    # Example of how to use with your CSV format
-    try:
-        pairings, bye_pid, next_round = pair_round_from_csv("tournament.csv")
+    Generate pairings for the next round from a tournament CSV file.
+    
+    Args:
+        csv_file: Path to tournament CSV file
+        last_round: If True, indicates this is the final round
         
-        print(f"Pairings for Round {next_round}:")
-        print("=" * 50)
+    Returns:
+        Tuple of (pairings, bye_player_id, round_number) where:
+        - pairings: List of (white_id, white_name, black_id, black_name)
+        - bye_player_id: ID of player receiving bye, or None
+        - round_number: The round number being paired
+    """
+    standings_df, history_df = parse_tournament_csv(csv_file)
+    players, next_round = build_players(standings_df, history_df)
+    
+    engine = SwissPairingEngine(players)
+    pairings, bye_player = engine.generate_pairings()
+    
+    return pairings, bye_player, next_round
+
+
+if __name__ == "__main__":
+    # Example usage and testing
+    import sys
+    
+    if len(sys.argv) < 2:
+        print("Usage: python pairing_alg.py <tournament.csv> [--last-round]")
+        sys.exit(1)
+    
+    csv_file = sys.argv[1]
+    last_round = "--last-round" in sys.argv
+    
+    try:
+        pairings, bye_player, round_num = pair_round_from_csv(csv_file, last_round)
+        
+        print(f"\nROUND {round_num} PAIRINGS")
+        print("=" * 60)
         
         for i, (white_id, white_name, black_id, black_name) in enumerate(pairings, 1):
-            print(f"Table {i}: {white_name} (W) vs {black_name} (B)")
+            print(f"{i:2d}. {white_name} (W) vs {black_name} (B)")
         
-        if bye_pid:
-            print(f"\nBye: Player {bye_pid}")
+        if bye_player:
+            # Get bye player name
+            standings_df, _ = parse_tournament_csv(csv_file)
+            bye_name = standings_df[standings_df['ID'] == bye_player]['Name'].iloc[0]
+            print(f"\nBye: {bye_name}")
         
         print(f"\nTotal pairings: {len(pairings)}")
+        total_players = len(pairings) * 2 + (1 if bye_player else 0)
+        print(f"Total active players: {total_players}")
         
-    except FileNotFoundError:
-        print("CSV file not found. Please provide the correct path.")
     except Exception as e:
-        print(f"Error processing tournament: {e}")
+        print(f"Error: {e}")
+        sys.exit(1)
