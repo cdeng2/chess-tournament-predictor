@@ -184,7 +184,7 @@
             hidePairings();
 
             try {
-                const response = await fetch('http://chess-tournament-predictor.onrender.com/api/pairings', {
+                const response = await fetch('https://backend-chess-wsvo.onrender.com/api/pairings', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ url, is_last_round: isLastRound })
